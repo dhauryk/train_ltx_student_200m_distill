@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+import lpips
 import numpy as np
 import pandas as pd
 import torch
@@ -28,10 +29,21 @@ from safetensors.torch import save_file as save_safetensors
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 
-DEFAULT_ROLLOUT_PROMPT = (
-    "A close-up portrait video of one person with preserved identity, natural facial "
-    "expressions, blinking, gaze changes, head turns, smiling, talking, and varied "
-    "realistic facial motion, smooth temporal consistency"
+DEFAULT_ROLLOUT_PROMPT_BANK = (
+    "A close-up portrait video, the person blinks and slightly turns their head.",
+    "A close-up portrait video, the person smiles naturally.",
+    "A close-up portrait video, the person talks with subtle facial motion.",
+    "A close-up portrait video, the person looks to the side and back.",
+    "A close-up portrait video, the person nods gently.",
+    "A close-up portrait video, the person laughs softly.",
+    "A close-up portrait video, strong wind continuously moves the person's hair.",
+    "A close-up portrait video, the camera slowly moves closer.",
+    "A close-up portrait video, the background lights flicker softly.",
+    "A close-up portrait video, the person changes from a neutral expression to a smile.",
+    "A close-up portrait video, strong wind moves the person's hair while the camera slowly moves closer.",
+    "A close-up portrait video, the person smiles and turns their head while wind moves their hair and the camera gently pushes in.",
+    "A close-up portrait video, the person blinks and smiles while wind moves their hair and background lights shift softly.",
+    "A close-up portrait video, the person turns their head as the camera moves closer and their hair moves continuously in the wind.",
 )
 
 DEFAULT_TRAINING_NEGATIVE_PROMPT = (
@@ -49,7 +61,8 @@ class PortraitStudentConfig:
     manifest_name: str = "celebv_hq_manifest.csv"
     output_dir: str = "outputs_ltx_student_celebv_hq"
     max_sequence_length: int = 256
-    rollout_prompt: str = DEFAULT_ROLLOUT_PROMPT
+    rollout_prompt_bank: Tuple[str, ...] = DEFAULT_ROLLOUT_PROMPT_BANK
+    rollout_prompt_bank_probability: float = 0.35
     training_negative_prompt: str = DEFAULT_TRAINING_NEGATIVE_PROMPT
 
     # Data and the deployment shape
@@ -62,8 +75,8 @@ class PortraitStudentConfig:
     validation_fraction: float = 0.01
     max_train_samples: Optional[int] = None
 
-    # ~590M parameters: eight full-width blocks preserve the teacher representation space.
-    student_num_layers: int = 8
+    # ~983M parameters: fourteen full-width blocks preserve the teacher representation space.
+    student_num_layers: int = 14
     student_num_attention_heads: int = 32
     student_attention_head_dim: int = 64
     initialize_from_teacher: bool = True
@@ -87,31 +100,26 @@ class PortraitStudentConfig:
     flow_matching_weight: float = 0.25
     x0_reconstruction_weight: float = 0.2
     feature_mse_weight: float = 0.25
-    feature_distillation_steps: int = 15_000
+    final_feature_mse_weight: float = 0.10
     cfg_pair_probability: float = 0.25
     timestep_high_probability: float = 1 / 3
     timestep_mid_probability: float = 1 / 3
     timestep_low_probability: float = 1 / 3
     face_token_weight: float = 3.0
     background_token_weight: float = 0.35
-    identity_consistency_weight: float = 0.05
     temporal_consistency_weight: float = 0.05
 
     # Train on states produced by the student itself.
     rollout_probability: float = 0.40
-    final_rollout_probability: float = 0.75
+    final_rollout_probability: float = 0.50
     rollout_inference_steps: int = 25
-    rollout_max_depth: int = 24
-    rollout_guidance_scale: float = 1.5
-    rollout_prompt_probability: float = 1.0
-    final_rollout_prompt_probability: float = 1.0
-    regular_rollout_prompt_probability: float = 0.0
-    final_regular_rollout_prompt_probability: float = 0.0
+    rollout_max_depth: int = 22
+    rollout_backprop_steps: int = 3
+    rollout_guidance_scale: float = 3.0
     specialization_start_fraction: float = 0.60
-    late_rollout_min_depth: int = 20
-    final_guided_teacher_mse_weight: float = 1.25
-    final_flow_matching_weight: float = 0.05
-    final_x0_reconstruction_weight: float = 0.05
+    final_guided_teacher_mse_weight: float = 0.75
+    final_flow_matching_weight: float = 0.20
+    final_x0_reconstruction_weight: float = 0.15
 
     # IO / validation
     log_every_steps: int = 10
@@ -120,11 +128,12 @@ class PortraitStudentConfig:
     # Share of the held-out validation split scored on every validation pass.
     validation_eval_fraction: float = 1.0
     rollout_validation_batches: int = 64
-    rollout_validation_depth: int = 24
     endpoint_validation_batches: int = 8
-    endpoint_validation_weight: float = 0.35
-    endpoint_identity_weight: float = 0.10
-    endpoint_motion_weight: float = 0.05
+    selection_rollout_weight: float = 0.25
+    selection_endpoint_weight: float = 0.30
+    selection_temporal_weight: float = 0.20
+    selection_perceptual_weight: float = 0.20
+    selection_motion_weight: float = 0.05
     ema_decay: float = 0.9995
     ema_update_every: int = 10
     ema_start_step: int = 1_000
@@ -225,7 +234,7 @@ class CelebVHQVideoDataset(Dataset):
                 f"CelebV-HQ manifest references {len(missing_files)} missing clips. "
                 "Resume download_celebv_hq.py before training."
             )
-        frame["caption"] = frame["caption"].fillna(cfg.rollout_prompt).astype(str)
+        frame["caption"] = frame["caption"].astype(str)
         frame["regular_eligible"] = frame["regular_eligible"].map(_manifest_bool)
 
         if cfg.max_train_samples is not None:
@@ -344,10 +353,16 @@ class CelebVHQVideoDataset(Dataset):
             raise RuntimeError(
                 f"Failed to decode CelebV-HQ frame {record.clip_id}: {error}"
             ) from error
+        prompt_rng = self._rng(index, "rollout-prompt")
+        caption = record.caption
+        if self.training and (
+            prompt_rng.random() < self.cfg.rollout_prompt_bank_probability
+        ):
+            caption = prompt_rng.choice(self.cfg.rollout_prompt_bank)
         return {
             "conditioning_image": image,
             "face_mask": face_mask,
-            "caption": self.cfg.rollout_prompt,
+            "caption": caption,
             "path": record.path,
             "clip_id": record.clip_id,
             "is_rollout": True,
@@ -363,39 +378,33 @@ class CelebVHQTrainingDataset(Dataset):
     def __init__(self, cfg: PortraitStudentConfig, dataset: CelebVHQVideoDataset):
         self.cfg = cfg
         self.dataset = dataset
-        self.epoch = 0
-        self.rollout_probability = cfg.rollout_probability
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def set_epoch(self, epoch: int, rollout_probability: float) -> None:
-        self.epoch = int(epoch)
-        self.rollout_probability = float(rollout_probability)
-        self.dataset.set_epoch(epoch)
-
-    def __getitem__(self, index: int) -> Dict[str, object]:
+    def __getitem__(self, request: Tuple[int, float]) -> Dict[str, object]:
+        index, rollout_probability = request
         record = self.dataset.records[index]
         digest = hashlib.sha1(
-            f"{self.cfg.seed}:{self.epoch}:{record.clip_id}:batch-kind".encode(
+            f"{self.cfg.seed}:{self.dataset.epoch}:{record.clip_id}:batch-kind".encode(
                 "utf-8"
             )
         ).digest()
         decision = int.from_bytes(digest[:8], "little") / float(2**64)
-        if not record.regular_eligible or decision < self.rollout_probability:
+        if not record.regular_eligible or decision < rollout_probability:
             return self.dataset.rollout_item(index)
         return self.dataset.video_item(index)
 
 
-class FixedOrderSampler(Sampler[int]):
-    def __init__(self, indices: Sequence[int]):
-        self.indices = list(indices)
+class FixedOrderSampler(Sampler[object]):
+    def __init__(self, requests: Sequence[object]):
+        self.requests = list(requests)
 
-    def __iter__(self) -> Iterator[int]:
-        return iter(self.indices)
+    def __iter__(self) -> Iterator[object]:
+        return iter(self.requests)
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.requests)
 
 
 def seed_data_loader_worker(worker_id: int, base_seed: int) -> None:
@@ -554,18 +563,6 @@ def masked_smooth_l1(
     return (elementwise * mask).sum() / denominator
 
 
-def latent_identity_distance(
-    predicted_x0: torch.Tensor,
-    conditioning_latents: torch.Tensor,
-    latent_face_mask: torch.Tensor,
-) -> torch.Tensor:
-    future = predicted_x0[:, :, 1:]
-    reference = conditioning_latents[:, :, :1].expand_as(future)
-    distance = 1.0 - F.cosine_similarity(future, reference, dim=1)
-    mask = latent_face_mask.squeeze(1).expand(-1, future.shape[2], -1, -1)
-    return (distance * mask).sum() / mask.sum().clamp_min(1.0)
-
-
 def latent_temporal_distance(
     predicted_x0: torch.Tensor,
     latent_face_mask: torch.Tensor,
@@ -683,10 +680,13 @@ class PortraitStudentTrainer:
                 "Timestep high/mid/low probabilities must sum to 1, got "
                 f"{timestep_probability_sum:.6f}"
             )
-        if cfg.rollout_max_depth >= cfg.rollout_inference_steps:
+        if (
+            cfg.rollout_max_depth + cfg.rollout_backprop_steps
+            > cfg.rollout_inference_steps
+        ):
             raise ValueError(
-                "rollout_max_depth must be at most rollout_inference_steps - 1; "
-                "depth 24 means the target is the 25th and final denoising update."
+                "rollout_max_depth + rollout_backprop_steps must not exceed "
+                "rollout_inference_steps."
             )
 
         self.cfg = cfg
@@ -739,6 +739,9 @@ class PortraitStudentTrainer:
         self.teacher.requires_grad_(False)
         self.pipe.vae.eval()
         self.pipe.vae.requires_grad_(False)
+        self.pipe.vae.enable_tiling()
+        self.perceptual_metric = lpips.LPIPS(net="alex", verbose=False).eval()
+        self.perceptual_metric.requires_grad_(False)
         temporal_ratio = int(self.pipe.vae_temporal_compression_ratio)
         if (cfg.frames - 1) % temporal_ratio != 0:
             raise ValueError(
@@ -800,9 +803,6 @@ class PortraitStudentTrainer:
         self.negative_prompt_embeds, self.negative_prompt_mask = self._encode_captions(
             [cfg.training_negative_prompt]
         )
-        self.rollout_prompt_embeds, self.rollout_prompt_mask = self._encode_captions(
-            [cfg.rollout_prompt]
-        )
 
         self.global_step = 0
         self.videos_seen = 0
@@ -827,8 +827,10 @@ class PortraitStudentTrainer:
         return min(1.0, max(0.0, self.global_step / max(1, self.total_optimizer_steps)))
 
     def _specialization_mix(self) -> float:
+        return self._specialization_mix_at(self._training_progress())
+
+    def _specialization_mix_at(self, progress: float) -> float:
         start = float(self.cfg.specialization_start_fraction)
-        progress = self._training_progress()
         if progress <= start:
             return 0.0
         return min(1.0, (progress - start) / max(1e-6, 1.0 - start))
@@ -837,42 +839,36 @@ class PortraitStudentTrainer:
         mix = self._specialization_mix()
         return initial + mix * (final - initial)
 
-    def _current_rollout_prompt_probability(self, use_rollout: bool) -> float:
-        if use_rollout:
-            return self._curriculum_value(
-                self.cfg.rollout_prompt_probability,
-                self.cfg.final_rollout_prompt_probability,
-            )
-        return self._curriculum_value(
-            self.cfg.regular_rollout_prompt_probability,
-            self.cfg.final_regular_rollout_prompt_probability,
+    def _rollout_probability_at(self, progress: float) -> float:
+        mix = self._specialization_mix_at(progress)
+        return (
+            self.cfg.rollout_probability
+            + mix
+            * (self.cfg.final_rollout_probability - self.cfg.rollout_probability)
         )
 
     def _make_train_loader(self, epoch: int, start_sample: int) -> DataLoader:
-        projected_progress = min(1.0, (epoch + 1) / max(1, self.cfg.epochs))
-        if projected_progress <= self.cfg.specialization_start_fraction:
-            projected_mix = 0.0
-        else:
-            projected_mix = (
-                projected_progress - self.cfg.specialization_start_fraction
-            ) / max(1e-6, 1.0 - self.cfg.specialization_start_fraction)
-        rollout_probability = (
-            self.cfg.rollout_probability
-            + projected_mix
-            * (
-                self.cfg.final_rollout_probability
-                - self.cfg.rollout_probability
-            )
-        )
-        self.train_dataset.set_epoch(epoch, rollout_probability)
-        print(
-            f"epoch={epoch} rollout_probability={rollout_probability:.3f} "
-            f"projected_specialization_mix={projected_mix:.3f}"
-        )
+        self.train_video_dataset.set_epoch(epoch)
         generator = torch.Generator().manual_seed(self.cfg.seed + epoch)
         order = torch.randperm(len(self.train_dataset), generator=generator).tolist()
-        order = order[start_sample:]
-        sampler = FixedOrderSampler(order)
+        total_samples = len(self.train_dataset) * self.cfg.epochs
+        requests = [
+            (
+                index,
+                self._rollout_probability_at(
+                    (epoch * len(self.train_dataset) + position)
+                    / max(1, total_samples - 1)
+                ),
+            )
+            for position, index in enumerate(order)
+        ]
+        requests = requests[start_sample:]
+        sampler = FixedOrderSampler(requests)
+        if requests:
+            print(
+                f"epoch={epoch} rollout_probability="
+                f"{requests[0][1]:.3f}->{requests[-1][1]:.3f}"
+            )
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.batch_size,
@@ -1023,6 +1019,16 @@ class PortraitStudentTrainer:
         )
         return embeds, mask
 
+    def _encode_batch_captions(
+        self, batch: Dict[str, object]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        raw_captions = batch["caption"]
+        if isinstance(raw_captions, str):
+            captions = [raw_captions]
+        else:
+            captions = [str(caption) for caption in raw_captions]
+        return self._encode_captions(captions)
+
     def _token_timesteps(
         self, timesteps: torch.Tensor, generated_token_mask: torch.Tensor
     ) -> torch.Tensor:
@@ -1156,7 +1162,6 @@ class PortraitStudentTrainer:
         feature_loss: Optional[torch.Tensor] = None,
         feature_loss_weight: float = 0.0,
         x0_loss: Optional[torch.Tensor] = None,
-        identity_loss: Optional[torch.Tensor] = None,
         temporal_loss: Optional[torch.Tensor] = None,
         guided_student_prediction: Optional[torch.Tensor] = None,
         guided_teacher_prediction: Optional[torch.Tensor] = None,
@@ -1188,8 +1193,6 @@ class PortraitStudentTrainer:
             feature_loss = teacher_mse.new_zeros(())
         if x0_loss is None:
             x0_loss = teacher_mse.new_zeros(())
-        if identity_loss is None:
-            identity_loss = teacher_mse.new_zeros(())
         if temporal_loss is None:
             temporal_loss = teacher_mse.new_zeros(())
         if (
@@ -1228,7 +1231,6 @@ class PortraitStudentTrainer:
             + flow_weight * flow_loss
             + x0_weight * x0_loss
             + feature_loss_weight * feature_loss
-            + self.cfg.identity_consistency_weight * identity_loss
             + self.cfg.temporal_consistency_weight * temporal_loss
         )
         return {
@@ -1239,17 +1241,14 @@ class PortraitStudentTrainer:
             "flow_mse": flow_loss,
             "x0_smooth_l1": x0_loss,
             "feature_distance": feature_loss,
-            "identity_distance": identity_loss,
             "temporal_distance": temporal_loss,
         }
 
     def _feature_distillation_weight(self) -> float:
-        steps = self.cfg.feature_distillation_steps
-        layer_mapping = self.initialization_report.get("teacher_layer_mapping", [])
-        if not layer_mapping or steps <= 0 or self.global_step >= steps:
-            return 0.0
-        remaining = 1.0 - self.global_step / max(1, steps)
-        return self.cfg.feature_mse_weight * remaining
+        return self._curriculum_value(
+            self.cfg.feature_mse_weight,
+            self.cfg.final_feature_mse_weight,
+        )
 
     def _sample_training_timestep(
         self, batch_size: int
@@ -1441,11 +1440,6 @@ class PortraitStudentTrainer:
             [image_latents, clean_latents[:, :, 1:]],
             dim=2,
         )
-        identity_loss = latent_identity_distance(
-            predicted_x0_5d,
-            image_latents,
-            latent_face_mask,
-        )
         temporal_loss = latent_temporal_distance(
             predicted_x0_5d,
             latent_face_mask,
@@ -1461,7 +1455,6 @@ class PortraitStudentTrainer:
             feature_loss=feature_loss,
             feature_loss_weight=feature_loss_weight,
             x0_loss=x0_loss,
-            identity_loss=identity_loss,
             temporal_loss=temporal_loss,
             guided_student_prediction=guided_student_prediction,
             guided_teacher_prediction=guided_teacher_prediction,
@@ -1488,6 +1481,24 @@ class PortraitStudentTrainer:
             return min(16, maximum)
         return maximum
 
+    def _rollout_step(
+        self,
+        packed_state: torch.Tensor,
+        prediction: torch.Tensor,
+        step_index: int,
+        generated_token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        sigmas = self.rollout_scheduler.sigmas
+        delta_sigma = torch.as_tensor(
+            sigmas[step_index + 1] - sigmas[step_index],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        return (
+            packed_state
+            + delta_sigma * prediction * generated_token_mask.unsqueeze(-1)
+        )
+
     def _rollout_distillation_batch(
         self,
         image_latents: torch.Tensor,
@@ -1513,118 +1524,138 @@ class PortraitStudentTrainer:
             dtype=torch.float32,
         )
         latent_state[:, :, :1] = image_latents
-        maximum_depth = min(
-            self._current_rollout_max_depth(),
-            len(self.rollout_scheduler.timesteps) - 1,
+        schedule_max_depth = (
+            len(self.rollout_scheduler.timesteps) - self.cfg.rollout_backprop_steps
         )
         if forced_depth is None:
-            minimum_depth = int(
-                round(
-                    1
-                    + self._specialization_mix()
-                    * (self.cfg.late_rollout_min_depth - 1)
-                )
+            maximum_depth = min(
+                self._current_rollout_max_depth(),
+                schedule_max_depth,
             )
-            minimum_depth = min(maximum_depth, max(1, minimum_depth))
-            depth = random.randint(minimum_depth, max(1, maximum_depth))
+            depth = random.randint(0, maximum_depth)
         else:
             depth = min(
-                max(1, int(forced_depth)),
+                max(0, int(forced_depth)),
                 self.cfg.rollout_max_depth,
-                len(self.rollout_scheduler.timesteps) - 1,
+                schedule_max_depth,
             )
 
+        packed_state = self._pack(latent_state)
         was_training = self.student.training
         self.student.eval()
         with torch.no_grad():
-            for timestep in self.rollout_scheduler.timesteps[:depth]:
-                packed = self._pack(latent_state)
+            for step_index, timestep in enumerate(
+                self.rollout_scheduler.timesteps[:depth]
+            ):
                 token_timesteps = self._token_timesteps(
                     timestep, generated_token_mask
                 )
                 with torch.autocast("cuda", dtype=self.teacher_dtype):
                     prediction = self._guided_model_forward(
                         self.student,
-                        packed,
+                        packed_state,
                         token_timesteps,
                         positive_prompt_embeds,
                         positive_prompt_mask,
                     )
-                prediction_5d = self._unpack(prediction)
-                next_generated = self.rollout_scheduler.step(
-                    prediction_5d[:, :, 1:],
-                    timestep,
-                    latent_state[:, :, 1:],
-                    return_dict=False,
-                )[0]
-                latent_state = torch.cat(
-                    [latent_state[:, :, :1], next_generated], dim=2
+                packed_state = self._rollout_step(
+                    packed_state,
+                    prediction,
+                    step_index,
+                    generated_token_mask,
                 )
         self.student.train(was_training)
 
-        target_timestep = self.rollout_scheduler.timesteps[depth]
-        packed = self._pack(latent_state)
-        token_timesteps = self._token_timesteps(
-            target_timestep, generated_token_mask
-        )
+        student_state = packed_state
+        teacher_token_mask = torch.cat([token_weights, token_weights], dim=0)
+        totals: Dict[str, torch.Tensor] = {}
 
-        with torch.no_grad(), torch.autocast("cuda", dtype=self.teacher_dtype):
-            teacher_guided, teacher_negative, teacher_positive = self._cfg_model_forward(
-                self.teacher,
-                packed,
-                token_timesteps,
-                positive_prompt_embeds,
-                positive_prompt_mask,
+        for step_index in range(depth, depth + self.cfg.rollout_backprop_steps):
+            timestep = self.rollout_scheduler.timesteps[step_index]
+            token_timesteps = self._token_timesteps(
+                timestep, generated_token_mask
             )
-        with torch.autocast("cuda", dtype=self.teacher_dtype):
-            student_guided, student_negative, student_positive = self._cfg_model_forward(
-                self.student,
-                packed,
-                token_timesteps,
-                positive_prompt_embeds,
-                positive_prompt_mask,
+            teacher_input = student_state.detach()
+            with torch.no_grad(), torch.autocast(
+                "cuda", dtype=self.teacher_dtype
+            ):
+                teacher_guided, teacher_negative, teacher_positive = (
+                    self._cfg_model_forward(
+                        self.teacher,
+                        teacher_input,
+                        token_timesteps,
+                        positive_prompt_embeds,
+                        positive_prompt_mask,
+                    )
+                )
+            with torch.autocast("cuda", dtype=self.teacher_dtype):
+                student_guided, student_negative, student_positive = (
+                    self._cfg_model_forward(
+                        self.student,
+                        student_state,
+                        token_timesteps,
+                        positive_prompt_embeds,
+                        positive_prompt_mask,
+                    )
+                )
+
+            sigma = torch.as_tensor(
+                self.rollout_scheduler.sigmas[step_index],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            student_x0 = student_state - sigma * student_guided
+            teacher_x0 = teacher_input - sigma * teacher_guided
+            x0_loss = masked_smooth_l1(
+                student_x0,
+                teacher_x0,
+                token_weights,
+            )
+            student_x0_5d = self._unpack(student_x0)
+            teacher_x0_5d = self._unpack(teacher_x0)
+            student_x0_5d = torch.cat(
+                [image_latents, student_x0_5d[:, :, 1:]],
+                dim=2,
+            )
+            teacher_x0_5d = torch.cat(
+                [image_latents, teacher_x0_5d[:, :, 1:]],
+                dim=2,
+            )
+            temporal_loss = latent_temporal_distance(
+                student_x0_5d,
+                latent_face_mask,
+                target_x0=teacher_x0_5d,
             )
 
-        student_prediction = torch.cat([student_negative, student_positive], dim=0)
-        teacher_prediction = torch.cat([teacher_negative, teacher_positive], dim=0)
-        teacher_token_mask = torch.cat(
-            [token_weights, token_weights], dim=0
-        )
+            step_losses = self._distillation_losses(
+                torch.cat([student_negative, student_positive], dim=0),
+                torch.cat([teacher_negative, teacher_positive], dim=0),
+                teacher_token_mask,
+                flow_target=None,
+                x0_loss=x0_loss,
+                temporal_loss=temporal_loss,
+                guided_student_prediction=student_guided,
+                guided_teacher_prediction=teacher_guided,
+                guided_token_mask=token_weights,
+            )
+            for name, value in step_losses.items():
+                totals[name] = totals.get(name, value.new_zeros(())) + value
 
-        sigma = torch.as_tensor(
-            self.rollout_scheduler.sigmas[depth],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        predicted_x0 = packed - sigma * student_guided
-        unpacked_x0 = self._unpack(predicted_x0)
-        predicted_x0_5d = torch.cat(
-            [image_latents, unpacked_x0[:, :, 1:]],
-            dim=2,
-        )
-        identity_loss = latent_identity_distance(
-            predicted_x0_5d,
-            image_latents,
-            latent_face_mask,
-        )
-        temporal_loss = latent_temporal_distance(
-            predicted_x0_5d,
-            latent_face_mask,
-        )
+            student_state = self._rollout_step(
+                student_state,
+                student_guided,
+                step_index,
+                generated_token_mask,
+            )
 
-        # There is no exact real-video flow target on a state generated by the student.
-        losses = self._distillation_losses(
-            student_prediction,
-            teacher_prediction,
-            teacher_token_mask,
-            flow_target=None,
-            identity_loss=identity_loss,
-            temporal_loss=temporal_loss,
-            guided_student_prediction=student_guided,
-            guided_teacher_prediction=teacher_guided,
-            guided_token_mask=token_weights,
-        )
+        losses = {
+            name: value / self.cfg.rollout_backprop_steps
+            for name, value in totals.items()
+        }
         losses["rollout_depth"] = losses["loss"].new_tensor(float(depth))
+        losses["rollout_steps"] = losses["loss"].new_tensor(
+            float(self.cfg.rollout_backprop_steps)
+        )
         return losses
 
     def _compute_batch_losses(
@@ -1633,33 +1664,15 @@ class PortraitStudentTrainer:
         use_rollout: bool,
         allow_negative: bool,
         forced_rollout_depth: Optional[int] = None,
-        force_rollout_prompt: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if use_rollout:
             clean_latents = None
             image_latents = self._encode_conditioning_batch(batch)
         else:
             clean_latents, image_latents = self._encode_video_batch(batch)
-        batch_size = image_latents.shape[0]
-        use_rollout_prompt = (
-            force_rollout_prompt
-            or random.random()
-            < self._current_rollout_prompt_probability(use_rollout)
+        positive_prompt_embeds, positive_prompt_mask = self._encode_batch_captions(
+            batch
         )
-        if use_rollout_prompt:
-            positive_prompt_embeds = self.rollout_prompt_embeds.expand(
-                batch_size, -1, -1
-            )
-            positive_prompt_mask = self.rollout_prompt_mask.expand(batch_size, -1)
-        else:
-            raw_captions = batch["caption"]
-            if isinstance(raw_captions, str):
-                captions = [raw_captions]
-            else:
-                captions = [str(caption) for caption in raw_captions]
-            positive_prompt_embeds, positive_prompt_mask = self._encode_captions(
-                captions
-            )
         if use_rollout:
             return self._rollout_distillation_batch(
                 image_latents,
@@ -1719,14 +1732,44 @@ class PortraitStudentTrainer:
         return latent_state
 
     @torch.no_grad()
+    def _decode_endpoint_frames(self, latents: torch.Tensor) -> torch.Tensor:
+        latents = self.pipe._denormalize_latents(
+            latents,
+            self.pipe.vae.latents_mean,
+            self.pipe.vae.latents_std,
+            self.pipe.vae.config.scaling_factor,
+        ).to(self.teacher_dtype)
+        timestep = None
+        if self.pipe.vae.config.timestep_conditioning:
+            timestep = torch.zeros(
+                latents.shape[0],
+                device=self.device,
+                dtype=self.teacher_dtype,
+            )
+        video = self.pipe.vae.decode(
+            latents,
+            timestep,
+            return_dict=False,
+        )[0]
+        frame_indices = [video.shape[2] // 2, video.shape[2] - 1]
+        frames = video[:, :, frame_indices].permute(0, 2, 1, 3, 4)
+        frames = frames.reshape(-1, 3, frames.shape[-2], frames.shape[-1])
+        frames = F.interpolate(
+            frames.float(),
+            size=(256, 256),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return frames.clamp(-1.0, 1.0).cpu()
+
+    @torch.no_grad()
     def _endpoint_validation_batch(
         self,
         batch: Dict[str, object],
     ) -> Dict[str, torch.Tensor]:
         image_latents = self._encode_conditioning_batch(batch)
         batch_size = image_latents.shape[0]
-        prompt_embeds = self.rollout_prompt_embeds.expand(batch_size, -1, -1)
-        prompt_mask = self.rollout_prompt_mask.expand(batch_size, -1)
+        prompt_embeds, prompt_mask = self._encode_batch_captions(batch)
         initial_noise = torch.randn(
             batch_size,
             image_latents.shape[1],
@@ -1769,16 +1812,6 @@ class PortraitStudentTrainer:
             packed_teacher,
             token_weights,
         )
-        student_identity = latent_identity_distance(
-            student_endpoint,
-            image_latents,
-            latent_face_mask,
-        )
-        teacher_identity = latent_identity_distance(
-            teacher_endpoint,
-            image_latents,
-            latent_face_mask,
-        )
         student_motion = latent_motion_score(
             student_endpoint,
             latent_face_mask,
@@ -1793,15 +1826,20 @@ class PortraitStudentTrainer:
             latent_face_mask,
             target_x0=teacher_endpoint,
         )
+        student_frames = self._decode_endpoint_frames(student_endpoint)
+        teacher_frames = self._decode_endpoint_frames(teacher_endpoint)
+        perceptual_distance = self.perceptual_metric(
+            student_frames,
+            teacher_frames,
+        ).mean()
         return {
             "mse": endpoint_mse,
             "cosine": endpoint_cosine,
-            "identity": student_identity,
-            "teacher_identity": teacher_identity,
             "motion": student_motion,
             "teacher_motion": teacher_motion,
             "motion_error": motion_error,
             "temporal_distance": temporal_distance,
+            "lpips": perceptual_distance,
         }
 
     @torch.no_grad()
@@ -1861,8 +1899,7 @@ class PortraitStudentTrainer:
                     batch,
                     use_rollout=True,
                     allow_negative=True,
-                    forced_rollout_depth=self.cfg.rollout_validation_depth,
-                    force_rollout_prompt=True,
+                    forced_rollout_depth=self.cfg.rollout_max_depth,
                 )
                 for name, value in losses.items():
                     rollout_totals[name] = rollout_totals.get(name, 0.0) + float(
@@ -1908,23 +1945,33 @@ class PortraitStudentTrainer:
                 }
             )
 
-        endpoint_weight = self.cfg.endpoint_validation_weight
-        identity_weight = self.cfg.endpoint_identity_weight
-        motion_weight = self.cfg.endpoint_motion_weight
-        rollout_weight = 1.0 - endpoint_weight - identity_weight - motion_weight
-        if rollout_weight < 0:
-            raise ValueError("Validation selection weights must sum to at most 1.")
-        if "rollout_loss" in metrics and "endpoint_mse" in metrics:
+        if (
+            "rollout_teacher_mse" in metrics
+            and "endpoint_mse" in metrics
+        ):
             metrics["selection_loss"] = (
-                rollout_weight * metrics["rollout_loss"]
-                + endpoint_weight * metrics["endpoint_mse"]
-                + identity_weight * metrics["endpoint_identity"]
-                + motion_weight * metrics["endpoint_motion_error"]
+                self.cfg.selection_rollout_weight
+                * metrics["rollout_teacher_mse"]
+                + self.cfg.selection_endpoint_weight * metrics["endpoint_mse"]
+                + self.cfg.selection_temporal_weight
+                * metrics["endpoint_temporal_distance"]
+                + self.cfg.selection_perceptual_weight * metrics["endpoint_lpips"]
+                + self.cfg.selection_motion_weight
+                * metrics["endpoint_motion_error"]
             )
-        elif "rollout_loss" in metrics:
-            metrics["selection_loss"] = metrics["rollout_loss"]
+        elif "endpoint_mse" in metrics:
+            metrics["selection_loss"] = (
+                self.cfg.selection_endpoint_weight * metrics["endpoint_mse"]
+                + self.cfg.selection_temporal_weight
+                * metrics["endpoint_temporal_distance"]
+                + self.cfg.selection_perceptual_weight * metrics["endpoint_lpips"]
+                + self.cfg.selection_motion_weight
+                * metrics["endpoint_motion_error"]
+            )
+        elif "rollout_teacher_mse" in metrics:
+            metrics["selection_loss"] = metrics["rollout_teacher_mse"]
         else:
-            metrics["selection_loss"] = metrics["loss"]
+            metrics["selection_loss"] = metrics["teacher_mse"]
         print("validation:", {name: round(value, 6) for name, value in metrics.items()})
         return metrics
 
@@ -1951,7 +1998,6 @@ class PortraitStudentTrainer:
                 use_rollout=True,
                 allow_negative=True,
                 forced_rollout_depth=1,
-                force_rollout_prompt=True,
             )
             result.update(
                 {
@@ -2134,34 +2180,11 @@ class PortraitStudentTrainer:
         restored = self.student.__class__.from_pretrained(
             model_path, torch_dtype=torch.float32, local_files_only=True
         )
-        architecture_keys = (
-            "in_channels",
-            "out_channels",
-            "num_layers",
-            "num_attention_heads",
-            "attention_head_dim",
-            "cross_attention_dim",
-            "caption_channels",
-        )
-        restored_architecture = {
-            key: getattr(restored.config, key) for key in architecture_keys
-        }
-        expected_architecture = {
-            key: getattr(self.student.config, key) for key in architecture_keys
-        }
-        if restored_architecture != expected_architecture:
-            raise RuntimeError(
-                "Existing checkpoint architecture differs from the configured student "
-                f"{self.cfg.student_num_layers}x"
-                f"{self.cfg.student_num_attention_heads * self.cfg.student_attention_head_dim}. "
-                f"Remove {self.output_dir} before starting."
-            )
         self.student.load_state_dict(restored.state_dict())
         del restored
 
         state = torch.load(state_path, map_location="cpu", weights_only=False)
-        saved_signature = state.get("run_signature")
-        if saved_signature != self.run_signature:
+        if state["run_signature"] != self.run_signature:
             raise RuntimeError(
                 "Checkpoint data/config signature differs from this run. "
                 "Start with an empty output directory."
@@ -2172,37 +2195,22 @@ class PortraitStudentTrainer:
                 if torch.is_tensor(value):
                     optimizer_state[key] = value.to(self.device)
         self.lr_scheduler.load_state_dict(state["lr_scheduler"])
-        if "scaler" in state:
-            self.scaler.load_state_dict(state["scaler"])
+        self.scaler.load_state_dict(state["scaler"])
         ema_state_path = checkpoint / "ema_state.pt"
-        if ema_state_path.exists():
-            self.ema.load_state_dict(
-                torch.load(ema_state_path, map_location="cpu", weights_only=False)
-            )
-        else:
-            self.ema = CPUModelEMA(
-                self.student,
-                decay=self.cfg.ema_decay,
-                update_every=self.cfg.ema_update_every,
-            )
-            print("EMA state was missing; reinitialized EMA from restored student.")
-
-        self.start_epoch = int(state.get("next_epoch", 0))
-        self.start_sample_in_epoch = int(state.get("next_sample_in_epoch", 0))
-        self.global_step = int(state.get("global_step", 0))
-        self.videos_seen = int(state.get("videos_seen", 0))
-        self.best_validation_loss = float(
-            state.get("best_validation_loss", float("inf"))
+        self.ema.load_state_dict(
+            torch.load(ema_state_path, map_location="cpu", weights_only=False)
         )
 
-        if "python_random_state" in state:
-            random.setstate(state["python_random_state"])
-        if "numpy_random_state" in state:
-            np.random.set_state(state["numpy_random_state"])
-        if "torch_random_state" in state:
-            torch.set_rng_state(state["torch_random_state"])
-        if "cuda_random_state" in state:
-            torch.cuda.set_rng_state_all(state["cuda_random_state"])
+        self.start_epoch = int(state["next_epoch"])
+        self.start_sample_in_epoch = int(state["next_sample_in_epoch"])
+        self.global_step = int(state["global_step"])
+        self.videos_seen = int(state["videos_seen"])
+        self.best_validation_loss = float(state["best_validation_loss"])
+
+        random.setstate(state["python_random_state"])
+        np.random.set_state(state["numpy_random_state"])
+        torch.set_rng_state(state["torch_random_state"])
+        torch.cuda.set_rng_state_all(state["cuda_random_state"])
 
         print(
             "Resumed exactly from "
@@ -2318,9 +2326,11 @@ class PortraitStudentTrainer:
                             "global_step": self.global_step,
                             "sample_in_epoch": sample_in_epoch,
                             "learning_rate": learning_rate,
-                            "rollout_probability": self.train_dataset.rollout_probability,
-                            "rollout_prompt_probability": (
-                                self._current_rollout_prompt_probability(True)
+                            "rollout_probability": self._rollout_probability_at(
+                                self._training_progress()
+                            ),
+                            "prompt_bank_probability": (
+                                self.cfg.rollout_prompt_bank_probability
                             ),
                             "specialization_mix": self._specialization_mix(),
                             **averaged,
@@ -2339,7 +2349,8 @@ class PortraitStudentTrainer:
             self._run_validation_and_maybe_save_best()
             self.save_latest(epoch + 1, 0)
 
-        return self.save_final()
+        self.save_final()
+        return self.output_dir / "checkpoint-best"
 
     def close(self) -> None:
         del self.optimizer
@@ -2350,8 +2361,7 @@ class PortraitStudentTrainer:
         del self.student
         del self.negative_prompt_embeds
         del self.negative_prompt_mask
-        del self.rollout_prompt_embeds
-        del self.rollout_prompt_mask
+        del self.perceptual_metric
         del self.pipe
         gc.collect()
         torch.cuda.empty_cache()

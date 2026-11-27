@@ -74,10 +74,19 @@ No CelebV-HQ clip is removed from training:
 - every action category, including talking, singing, eating, laughing, and
   expressive motion, can contribute real-video flow/x0 supervision;
 - only technically unsuitable clips (too short, low-FPS, blurry, or masked)
-  are routed to image-conditioned teacher rollout instead of being removed.
+  are always routed to image-conditioned teacher rollout instead of being
+  removed; compatible clips are split between real-video and rollout batches by
+  the 40–50% curriculum;
+- rollout uses the clip caption in 65% of samples and a motion/camera prompt
+  bank with combined wind+camera scenarios in 35%;
+- rollout probability grows continuously from 40% to 50%; windows cover the
+  available trajectory uniformly at CFG 3.0, and their last three steps are
+  differentiable against same-state teacher corrections;
+- checkpoint selection includes decoded LPIPS together with teacher-relative
+  endpoint, temporal, and motion metrics.
 
 The trainer uses every manifest clip and writes new checkpoints to
-`outputs_ltx_student_celebv_hq/` (8×2048 student).
+`outputs_ltx_student_celebv_hq/` (14×2048 student).
 
 Regenerate the deployment prompt embeddings once after this migration:
 
@@ -86,9 +95,9 @@ python save_portrait_embeds.py
 ```
 
 `preview_prompts.py` contains only the user-facing generation prompts.
-Training uses an identity-neutral rollout prompt from `ltx_portrait_student.py`
-plus the CelebV-HQ action captions, so changing preview wording does not require
-retraining the student.
+Training uses CelebV-HQ action captions plus the prompt bank from
+`ltx_portrait_student.py`. Validation uses the deterministic captions of its
+CelebV-HQ clips, so changing preview wording does not require retraining.
 
 ## WSL2: рабочая последовательность
 
@@ -185,7 +194,7 @@ poetry run python save_portrait_embeds.py
 ```
 
 Эти prompts не участвуют в обучении. Обучение использует action captions
-CelebV-HQ и нейтральный rollout prompt из `ltx_portrait_student.py`.
+CelebV-HQ и небольшой motion/camera prompt bank из `ltx_portrait_student.py`.
 
 ### 6. Обучение
 
